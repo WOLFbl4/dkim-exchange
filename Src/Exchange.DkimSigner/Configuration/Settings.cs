@@ -1,5 +1,7 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Xml.Serialization;
 
 namespace Exchange.DkimSigner.Configuration
@@ -49,7 +51,7 @@ namespace Exchange.DkimSigner.Configuration
 		{
 			if (File.Exists(filename))
 			{
-				using (Stream stream = File.OpenRead(filename))
+				using (Stream stream = new FileStream(filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
 				{
 					XmlSerializer serializer = new XmlSerializer(typeof(Settings));
 
@@ -60,8 +62,8 @@ namespace Exchange.DkimSigner.Configuration
 					SigningAlgorithm = settings.SigningAlgorithm;
 					HeaderCanonicalization = settings.HeaderCanonicalization;
 					BodyCanonicalization = settings.BodyCanonicalization;
-					HeadersToSign = settings.HeadersToSign;
-					Domains = settings.Domains;
+					HeadersToSign = settings.HeadersToSign ?? new List<string>();
+					Domains = settings.Domains ?? new List<DomainElement>();
 
 					return true;
 				}
@@ -86,11 +88,33 @@ namespace Exchange.DkimSigner.Configuration
 				Directory.CreateDirectory(directory);
 			}
 
-			using (StreamWriter writer = new StreamWriter(filename))
+			string temporaryFilename = Path.Combine(directory, Path.GetFileName(filename) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+			try
 			{
-				XmlSerializer serializer = new XmlSerializer(GetType());
-				serializer.Serialize(writer, this);
-				writer.Flush();
+				using (FileStream stream = new FileStream(temporaryFilename, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+				using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)))
+				{
+					XmlSerializer serializer = new XmlSerializer(GetType());
+					serializer.Serialize(writer, this);
+					writer.Flush();
+					stream.Flush(true);
+				}
+
+				if (File.Exists(filename))
+				{
+					File.Replace(temporaryFilename, filename, null);
+				}
+				else
+				{
+					File.Move(temporaryFilename, filename);
+				}
+			}
+			finally
+			{
+				if (File.Exists(temporaryFilename))
+				{
+					File.Delete(temporaryFilename);
+				}
 			}
 			return true;
 		}

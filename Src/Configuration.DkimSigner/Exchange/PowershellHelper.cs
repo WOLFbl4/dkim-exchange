@@ -76,6 +76,22 @@ namespace Configuration.DkimSigner.Exchange
 				pipeline.Commands.AddScript(sCommand);
 				pipeline.Commands.Add("Out-String");
 				Collection<PSObject> collection = pipeline.Invoke();
+				Collection<object> errors = pipeline.Error.ReadToEnd();
+
+				if (pipeline.HadErrors || errors.Count > 0)
+				{
+					StringBuilder errorText = new StringBuilder();
+					foreach (object errorRecord in errors)
+					{
+						if (errorRecord != null)
+						{
+							errorText.AppendLine(errorRecord.ToString());
+						}
+					}
+
+					string details = errorText.Length > 0 ? errorText.ToString().Trim() : "PowerShell reported an unspecified error.";
+					throw new ExchangeServerException("PowerShell command failed:\n" + details);
+				}
 
 				foreach (PSObject current in collection)
 				{

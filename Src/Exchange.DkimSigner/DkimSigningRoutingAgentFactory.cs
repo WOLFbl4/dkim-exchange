@@ -1,8 +1,10 @@
 ﻿using Exchange.DkimSigner.Configuration;
 using Microsoft.Exchange.Data.Transport;
 using Microsoft.Exchange.Data.Transport.Routing;
+using System;
 using System.IO;
 using System.Reflection;
+using System.Threading;
 
 namespace Exchange.DkimSigner
 {
@@ -20,6 +22,10 @@ namespace Exchange.DkimSigner
 		/// Watcher for changes on the settings file causing a reload of the settings when changed
 		/// </summary>
 		private FileSystemWatcher watcher;
+		private Timer reloadTimer;
+		private readonly object reloadMutex = new object();
+
+		private const int ReloadDebounceMilliseconds = 500;
 
 		/// <summary>
 		/// Initializes a new instance of the <see cref="DkimSigningRoutingAgentFactory"/> class.
@@ -30,9 +36,6 @@ namespace Exchange.DkimSigner
 			{
 				Logger.LogDebug("Initializing DkimSigner Service");
 			}
-
-			Settings config = new Settings();
-			config.InitHeadersToSign();
 
 			dkimSigner = new DkimSigner();
 
@@ -57,19 +60,26 @@ namespace Exchange.DkimSigner
 		/// </summary>
 		private void LoadSettings()
 		{
-			Settings config = new Settings();
-			config.InitHeadersToSign();
+			try
+			{
+				Settings config = new Settings();
+				config.InitHeadersToSign();
 
-			string assemblyDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-			if (assemblyDir != null && config.Load(Path.Combine(assemblyDir, "settings.xml")))
-			{
-				dkimSigner.UpdateSettings(config);
-				Logger.LogLevel = config.Loglevel;
-				Logger.LogInformation("Exchange DKIM settings loaded: " + config.SigningAlgorithm + ", Canonicalization Header Algorithm: " + config.HeaderCanonicalization + ", Canonicalization Body Algorithm: " + config.BodyCanonicalization + ", Number of domains: " + dkimSigner.GetDomains().Count);
+				string assemblyDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+				if (assemblyDir != null && config.Load(Path.Combine(assemblyDir, "settings.xml")))
+				{
+					dkimSigner.UpdateSettings(config);
+					Logger.LogLevel = config.Loglevel;
+					Logger.LogInformation("Exchange DKIM settings loaded: " + config.SigningAlgorithm + ", Canonicalization Header Algorithm: " + config.HeaderCanonicalization + ", Canonicalization Body Algorithm: " + config.BodyCanonicalization + ", Number of domains: " + dkimSigner.DomainCount);
+				}
+				else
+				{
+					Logger.LogError("Couldn't load the settings file. Existing settings remain active.\n");
+				}
 			}
-			else
+			catch (Exception ex)
 			{
-				Logger.LogError("Couldn't load the settings file.\n");
+				Logger.LogError("Couldn't reload the settings file. Existing settings remain active.\n" + ex);
 			}
 		}
 
@@ -91,8 +101,8 @@ namespace Exchange.DkimSigner
 			{
 				Path = Path.GetDirectoryName(filename),
 
-				// Watch for changes in LastAccess and LastWrite times, and the renaming of files or directories.
-				NotifyFilter = NotifyFilters.LastWrite,
+				// Atomic saves can surface as write, create, or rename events.
+				NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.FileName,
 
 				// Only watch text files.
 				Filter = Path.GetFileName(filename)
@@ -101,6 +111,7 @@ namespace Exchange.DkimSigner
 			// Add event handlers.
 			watcher.Changed += OnChanged;
 			watcher.Created += OnChanged;
+			watcher.Renamed += OnChanged;
 
 			// Begin watching.
 			watcher.EnableRaisingEvents = true;
@@ -113,6 +124,30 @@ namespace Exchange.DkimSigner
 		/// <param name="e"></param>
 		private void OnChanged(object source, FileSystemEventArgs e)
 		{
+			lock (reloadMutex)
+			{
+				if (reloadTimer == null)
+				{
+					reloadTimer = new Timer(ReloadSettings, null, ReloadDebounceMilliseconds, Timeout.Infinite);
+				}
+				else
+				{
+					reloadTimer.Change(ReloadDebounceMilliseconds, Timeout.Infinite);
+				}
+			}
+		}
+
+		private void ReloadSettings(object state)
+		{
+			lock (reloadMutex)
+			{
+				if (reloadTimer != null)
+				{
+					reloadTimer.Dispose();
+					reloadTimer = null;
+				}
+			}
+
 			Logger.LogInformation("Detected settings file change. Reloading...");
 			LoadSettings();
 		}

@@ -23,6 +23,8 @@ namespace Configuration.DkimSigner
 		// ##################### Variables ##########################
 		// ##########################################################
 
+		private static readonly TimeSpan TransportServiceActionTimeout = TimeSpan.FromMinutes(3);
+
 		private TransportService transportService;
 		private AutoResetEvent transportServiceActionCompleted;
 		private string transportServiceSuccessStatus;
@@ -143,15 +145,26 @@ namespace Configuration.DkimSigner
 		private async void CheckExchangeInstalled()
 		{
 			progressInstall.Style = ProgressBarStyle.Marquee;
-			await Task.Run(() => exchangeVersion = ExchangeServer.GetInstalledVersion());
-
-			lblExchangeVersionWait.Hide();
-			btInstall.Enabled = IsBtInstallEnabled();
-
-			// If the source for install have been specified in command line
-			if (zipUrl != null || performInstall)
+			try
 			{
-				Install();
+				await Task.Run(() => exchangeVersion = ExchangeServer.GetInstalledVersion());
+
+				lblExchangeVersionWait.Hide();
+				btInstall.Enabled = IsBtInstallEnabled();
+
+				// If the source for install have been specified in command line
+				if (zipUrl != null || performInstall)
+				{
+					Install();
+				}
+			}
+			catch (Exception ex)
+			{
+				exchangeVersion = null;
+				lblExchangeVersionWait.Hide();
+				progressInstall.Style = ProgressBarStyle.Continuous;
+				btInstall.Enabled = false;
+				MessageBox.Show(this, "Could not determine the installed Microsoft Exchange Server version:\n" + ex.Message, "Exchange detection error", MessageBoxButtons.OK, MessageBoxIcon.Error);
 			}
 		}
 
@@ -172,10 +185,23 @@ namespace Configuration.DkimSigner
 			// ### Is Exchange version supported?      ###
 			// ###########################################
 
-			if (ExchangeServer.IsSupportedVersion(exchangeVersion))
-				lbDownloadFiles.Enabled = true;
-			else
+			if (exchangeVersion == null || !ExchangeServer.IsSupportedVersion(exchangeVersion))
+			{
 				MessageBox.Show(this, $"The version of Microsoft Exchange Server installed on this computer ({exchangeVersion}) isn't supported.", "Version not supported", MessageBoxButtons.OK, MessageBoxIcon.Error);
+				btClose.Enabled = true;
+				gbSelectVersionToInstall.Enabled = true;
+				return;
+			}
+
+			if (transportService == null)
+			{
+				MessageBox.Show(this, "The MSExchangeTransport service is not available. Installation cannot continue.", "Service not available", MessageBoxButtons.OK, MessageBoxIcon.Error);
+				btClose.Enabled = true;
+				gbSelectVersionToInstall.Enabled = true;
+				return;
+			}
+
+			lbDownloadFiles.Enabled = true;
 
 			// path which is the base for copying the files. Should be the root of the downloaded .zip file.
 			string extractPath;
@@ -336,12 +362,21 @@ namespace Configuration.DkimSigner
 			{
 				if (transportService.GetStatus() != "Stopped")
 				{
+					bool serviceActionFailed = false;
 					transportServiceSuccessStatus = "Stopped";
 					transportService.Do(TransportServiceAction.Stop, delegate (string msg)
 					{
+						serviceActionFailed = true;
+						transportServiceActionCompleted.Set();
 						MessageBox.Show(msg, "Service error", MessageBoxButtons.OK, MessageBoxIcon.Error);
 					});
-					lbCopyFiles.Enabled = transportServiceActionCompleted.WaitOne();
+					bool serviceActionCompleted = transportServiceActionCompleted.WaitOne(TransportServiceActionTimeout);
+					transportServiceSuccessStatus = null;
+					lbCopyFiles.Enabled = serviceActionCompleted && !serviceActionFailed;
+					if (!serviceActionCompleted)
+					{
+						MessageBox.Show(this, "Timed out waiting for the MSExchangeTransport service to stop.", "Service timeout", MessageBoxButtons.OK, MessageBoxIcon.Error);
+					}
 				}
 				else
 				{
@@ -473,12 +508,22 @@ namespace Configuration.DkimSigner
 
 			if (lbStartService.Enabled)
 			{
+				bool serviceActionFailed = false;
 				transportServiceSuccessStatus = "Running";
 				transportService.Do(TransportServiceAction.Start, delegate (string msg)
 				{
+					serviceActionFailed = true;
+					transportServiceActionCompleted.Set();
 					MessageBox.Show(msg, "Service error", MessageBoxButtons.OK, MessageBoxIcon.Error);
 				});
-				picStartService.Image = transportServiceActionCompleted.WaitOne() ? statusImageList.Images[0] : statusImageList.Images[1];
+				bool serviceActionCompleted = transportServiceActionCompleted.WaitOne(TransportServiceActionTimeout);
+				transportServiceSuccessStatus = null;
+				bool serviceStarted = serviceActionCompleted && !serviceActionFailed;
+				picStartService.Image = serviceStarted ? statusImageList.Images[0] : statusImageList.Images[1];
+				if (!serviceActionCompleted)
+				{
+					MessageBox.Show(this, "Timed out waiting for the MSExchangeTransport service to start.", "Service timeout", MessageBoxButtons.OK, MessageBoxIcon.Error);
+				}
 			}
 			else
 			{

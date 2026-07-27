@@ -6,6 +6,7 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <LangVersion>latest</LangVersion>
     <Deterministic>true</Deterministic>
+    <PortableMimeKitVersion Condition="'$(PortableMimeKitVersion)' == ''">2.15.1</PortableMimeKitVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,7 +18,12 @@
       <HintPath>lib/Exchange 15/Microsoft.Exchange.Data.Transport.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <PackageReference Include="MimeKit" Version="2.15.1" />
+    <!-- This compatibility-only patch must bind to the MimeKit 2.15 assembly already
+         deployed by Exchange DKIM Signer 3.4.0. The advisory requires constructing
+         untrusted SMTP envelope addresses and sending them through an SMTP client;
+         this transport agent only parses and signs an existing MIME message. -->
+    <PackageReference Include="MimeKit" Version="$(PortableMimeKitVersion)" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-g7hc-96xr-gvvx" Condition="'$(PortableMimeKitVersion)' == '2.15.1'" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3" PrivateAssets="all" />
   </ItemGroup>
 </Project>

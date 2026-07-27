@@ -59,8 +59,21 @@ namespace Exchange.DkimSigner
 				Logger.LogDebug("Got new message, checking if I can sign it...");
 			}
 
-			var state = new MessageEventState(GetAgentAsyncContext(), e.MailItem);
-			ThreadPool.QueueUserWorkItem(new WaitCallback(HandleMessageEvent), state);
+			AgentAsyncContext asyncContext = GetAgentAsyncContext();
+			var state = new MessageEventState(asyncContext, e.MailItem);
+			try
+			{
+				if (!ThreadPool.QueueUserWorkItem(new WaitCallback(HandleMessageEvent), state))
+				{
+					Logger.LogError("Could not queue the DKIM signing operation.");
+					asyncContext.Complete();
+				}
+			}
+			catch
+			{
+				asyncContext.Complete();
+				throw;
+			}
 		}
 
 		[SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Log general exceptions")]
@@ -70,6 +83,7 @@ namespace Exchange.DkimSigner
 
 			try
 			{
+				state.AsyncContext.Resume();
 				SignMailItem(state.MailItem);
 			}
 			catch (Exception ex)
@@ -78,7 +92,6 @@ namespace Exchange.DkimSigner
 			}
 			finally
 			{
-				state.AsyncContext.Resume();
 				state.AsyncContext.Complete();
 			}
 		}
@@ -91,66 +104,62 @@ namespace Exchange.DkimSigner
 		[SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Log general exceptions")]
 		private void SignMailItem(MailItem mailItem)
 		{
+			if (mailItem == null || mailItem.Message == null)
+			{
+				Logger.LogWarning("A mail item without a message was received. Not signing email.");
+				return;
+			}
+
 			// If the mail item is a "system message" then it will be read-only here,
 			// and we can't sign it. Additionally, if the message has a "TnefPart",
 			// then it is in a proprietary format used by Outlook and Exchange Server,
 			// which means we shouldn't bother signing it.
-			if (!mailItem.Message.IsSystemMessage && mailItem.Message.TnefPart == null)
+			if (mailItem.Message.IsSystemMessage || mailItem.Message.TnefPart != null)
 			{
-				string domainPart = null;
-
-				/* Check if we have a valid From address */
-				if (!mailItem.FromAddress.IsValid || mailItem.FromAddress.DomainPart == null)
+				if (Logger.IsDebugEnabled())
 				{
-					// The FromAddress is empty. Try to get the domain from somewhere else (see https://github.com/Pro/dkim-exchange/issues/99)
-					string smtpAddress = (mailItem.Message != null && mailItem.Message.Sender != null) ? mailItem.Message.Sender.SmtpAddress : null;
-					if (!string.IsNullOrEmpty(smtpAddress))
-					{
-						try
-						{
-							domainPart = new MailAddress(smtpAddress).Host;
-						}
-						catch (FormatException)
-						{
-							// Ignore
-						}
-					}
-					if (domainPart == null)
-					{
-						Logger.LogWarning("Invalid from address '" + mailItem.FromAddress + "' and invalid SmtpAddress '" + smtpAddress + "'. Not signing email.");
-						return;
-					}
+					Logger.LogDebug("Message is a System message or of TNEF format. Not signing.");
 				}
-				else
-				{
-					// from address is valid
-					domainPart = mailItem.FromAddress.DomainPart;
-				}
+				return;
+			}
 
-				/* If domain was found in define domain configuration */
-				if (dkimSigner.GetDomains().ContainsKey(domainPart))
+			// DKIM d= must be selected from the RFC5322.From author domain. Using the
+			// routing/envelope sender here can break DMARC alignment.
+			string smtpAddress = mailItem.Message.From != null ? mailItem.Message.From.SmtpAddress : null;
+			string domainPart = null;
+			if (!string.IsNullOrWhiteSpace(smtpAddress))
+			{
+				try
 				{
-					try
-					{
-						dkimSigner.SignMessage(dkimSigner.GetDomains()[domainPart], mailItem);
-					}
-					catch (Exception ex)
-					{
-						Logger.LogError("Could not sign message: " + ex.Message);
-					}
-
+					domainPart = new MailAddress(smtpAddress).Host.TrimEnd('.');
 				}
-				else 
+				catch (FormatException)
 				{
-					if (Logger.IsDebugEnabled())
-					{
-						Logger.LogDebug("No entry found in config for domain '" + domainPart + "'");
-					}
+					// Logged below with the original value.
+				}
+			}
+
+			if (string.IsNullOrEmpty(domainPart))
+			{
+				Logger.LogWarning("Invalid or missing RFC5322 From address '" + smtpAddress + "'. Not signing email.");
+				return;
+			}
+
+			DkimSigner.DkimSigningContext signingContext;
+			if (dkimSigner.TryGetSigningContext(domainPart, out signingContext))
+			{
+				try
+				{
+					dkimSigner.SignMessage(signingContext, mailItem);
+				}
+				catch (Exception ex)
+				{
+					Logger.LogError("Could not sign message: " + ex.Message);
 				}
 			}
 			else if (Logger.IsDebugEnabled())
 			{
-				Logger.LogDebug("Message is a System message or of TNEF format. Not signing.");
+				Logger.LogDebug("No entry found in config for domain '" + domainPart + "'");
 			}
 		}
 	}

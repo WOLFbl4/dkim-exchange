@@ -14,13 +14,15 @@ $ErrorActionPreference = "Stop"
 $serviceName = "MSExchangeTransport"
 $targetDll = Join-Path $InstallDir "ExchangeDkimSigner.dll"
 $settingsPath = Join-Path $InstallDir "settings.xml"
-$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $backupDir = Join-Path $BackupRoot $timestamp
 $backupProgramDir = Join-Path $backupDir "Program"
 $changeStarted = Get-Date
 $targetChanged = $false
+$originalServiceStatus = $null
 
 function Set-RestrictedDirectoryAcl {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $acl = New-Object System.Security.AccessControl.DirectorySecurity
@@ -36,21 +38,46 @@ function Set-RestrictedDirectoryAcl {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    if ($PSCmdlet.ShouldProcess($Path, "Set restricted backup directory ACL")) {
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    }
 }
 
-function Restore-OriginalFiles {
+function Restore-OriginalFile {
     $service = Get-Service -Name $serviceName
     if ($service.Status -ne "Stopped") {
         Stop-Service -Name $serviceName -Force
         $service.WaitForStatus("Stopped", [TimeSpan]::FromMinutes(2))
     }
 
-    Copy-Item -LiteralPath (Join-Path $backupProgramDir "ExchangeDkimSigner.dll") -Destination $targetDll -Force
-    Copy-Item -LiteralPath (Join-Path $backupProgramDir "settings.xml") -Destination $settingsPath -Force
+    if ($targetChanged) {
+        Copy-Item -LiteralPath (Join-Path $backupProgramDir "ExchangeDkimSigner.dll") -Destination $targetDll -Force
+        Copy-Item -LiteralPath (Join-Path $backupProgramDir "settings.xml") -Destination $settingsPath -Force
 
-    Start-Service -Name $serviceName
-    (Get-Service -Name $serviceName).WaitForStatus("Running", [TimeSpan]::FromMinutes(2))
+        $restoredHash = (Get-FileHash -LiteralPath $targetDll -Algorithm SHA256).Hash
+        if ($restoredHash -ne $originalHash) {
+            throw "Restored DLL hash does not match the original file."
+        }
+        $restoredSettingsHash = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
+        if ($restoredSettingsHash -ne $originalSettingsHash) {
+            throw "Restored settings.xml hash does not match the original file."
+        }
+    }
+
+    switch ($originalServiceStatus) {
+        { $_ -in "Running", "StartPending", "ContinuePending" } {
+            Start-Service -Name $serviceName
+            (Get-Service -Name $serviceName).WaitForStatus("Running", [TimeSpan]::FromMinutes(2))
+            break
+        }
+        { $_ -in "Paused", "PausePending" } {
+            Start-Service -Name $serviceName
+            (Get-Service -Name $serviceName).WaitForStatus("Running", [TimeSpan]::FromMinutes(2))
+            Suspend-Service -Name $serviceName
+            (Get-Service -Name $serviceName).WaitForStatus("Paused", [TimeSpan]::FromMinutes(2))
+            break
+        }
+    }
 }
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -86,20 +113,30 @@ foreach ($name in $expectedReferences.Keys) {
     }
 }
 
+$originalHash = (Get-FileHash -LiteralPath $targetDll -Algorithm SHA256).Hash
+$originalSettingsHash = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash
+$patchHash = (Get-FileHash -LiteralPath $PatchDll -Algorithm SHA256).Hash
+$originalServiceStatus = (Get-Service -Name $serviceName).Status.ToString()
+
 New-Item -Path $backupProgramDir -ItemType Directory -Force | Out-Null
 Set-RestrictedDirectoryAcl -Path $backupDir
-Copy-Item -LiteralPath $InstallDir -Destination $backupProgramDir -Recurse -Force
+Copy-Item -LiteralPath $targetDll -Destination (Join-Path $backupProgramDir "ExchangeDkimSigner.dll") -Force
+Copy-Item -LiteralPath $settingsPath -Destination (Join-Path $backupProgramDir "settings.xml") -Force
 Copy-Item -LiteralPath $RollbackScript -Destination (Join-Path $backupDir "Rollback-ExchangeDkimSignerAsyncFix.ps1") -Force
 
-$originalHash = (Get-FileHash -LiteralPath $targetDll -Algorithm SHA256).Hash
-$patchHash = (Get-FileHash -LiteralPath $PatchDll -Algorithm SHA256).Hash
+if ((Get-FileHash -LiteralPath (Join-Path $backupProgramDir "ExchangeDkimSigner.dll") -Algorithm SHA256).Hash -ne $originalHash -or
+    (Get-FileHash -LiteralPath (Join-Path $backupProgramDir "settings.xml") -Algorithm SHA256).Hash -ne $originalSettingsHash) {
+    throw "Backup verification failed. Deployment was not started."
+}
+
 $metadata = [ordered]@{
     Created = (Get-Date).ToString("o")
     Computer = $env:COMPUTERNAME
     InstallDir = $InstallDir
     OriginalDllSha256 = $originalHash
+    OriginalSettingsSha256 = $originalSettingsHash
     PatchDllSha256 = $patchHash
-    OriginalServiceStatus = (Get-Service -Name $serviceName).Status.ToString()
+    OriginalServiceStatus = $originalServiceStatus
 }
 $metadata | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $backupDir "metadata.json") -Encoding UTF8
 
@@ -113,8 +150,8 @@ try {
         $service.WaitForStatus("Stopped", [TimeSpan]::FromMinutes(2))
     }
 
-    Copy-Item -LiteralPath $PatchDll -Destination $targetDll -Force
     $targetChanged = $true
+    Copy-Item -LiteralPath $PatchDll -Destination $targetDll -Force
 
     [xml]$settings = Get-Content -LiteralPath $settingsPath -Raw
     $headerChanged = $false
@@ -162,8 +199,13 @@ try {
 }
 catch {
     $deploymentError = $_
-    if ($targetChanged) {
-        Restore-OriginalFiles
+    try {
+        Restore-OriginalFile
     }
-    throw "Deployment failed and original files were restored: $($deploymentError.Exception.Message)"
+    catch {
+        $restoreError = $_
+        throw "Deployment failed: $($deploymentError.Exception.Message) Automatic restore also failed: $($restoreError.Exception.Message) Use the rollback script in '$backupDir'."
+    }
+
+    throw "Deployment failed and the original state was restored: $($deploymentError.Exception.Message)"
 }

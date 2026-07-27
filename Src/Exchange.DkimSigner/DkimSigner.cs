@@ -17,47 +17,55 @@ namespace Exchange.DkimSigner
 	public class DkimSigner
 	{
 
-		/// <summary>
-		/// The headers that should be a part of the DKIM signature, if present in the message.
-		/// </summary>
-		private HeaderId[] eligibleHeaders;
+		private sealed class DkimSettingsSnapshot
+		{
+			public Dictionary<string, DkimSigningContext> Domains { get; private set; }
+			public HeaderId[] EligibleHeaders { get; private set; }
 
-		/// <summary>
-		/// The DKIM canonicalization algorithm that is to be employed for the header.
-		/// </summary>
-		private DkimCanonicalizationAlgorithm headerCanonicalization;
+			public DkimSettingsSnapshot(Dictionary<string, DkimSigningContext> domains, HeaderId[] eligibleHeaders)
+			{
+				Domains = domains;
+				EligibleHeaders = eligibleHeaders;
+			}
+		}
 
-		/// <summary>
-		/// The DKIM canonicalization algorithm that is to be employed for the header.
-		/// </summary>
-		private DkimCanonicalizationAlgorithm bodyCanonicalization;
+		internal sealed class DkimSigningContext
+		{
+			public DomainElementSigner DomainSigner { get; private set; }
+			public HeaderId[] EligibleHeaders { get; private set; }
+			public object SyncRoot { get; private set; }
 
-		/// <summary>
-		/// Map the domain Host part to the corresponding domain settings object
-		/// </summary>
-		private readonly Dictionary<string, DomainElementSigner> domains;
+			public DkimSigningContext(DomainElementSigner domainSigner, HeaderId[] eligibleHeaders)
+			{
+				DomainSigner = domainSigner;
+				EligibleHeaders = (HeaderId[])eligibleHeaders.Clone();
+				SyncRoot = new object();
+			}
+		}
 
-		/// <summary>
-		/// Object used as a mutex when settings are updated during execution
-		/// </summary>
-		private readonly object settingsMutex;
+		private volatile DkimSettingsSnapshot settingsSnapshot;
+		private readonly object settingsUpdateMutex;
 
 		/// <summary>
 		/// Initializes a new instance of the <see cref="DkimSigner"/> class.
 		/// </summary>
 		public DkimSigner()
 		{
-			domains = new Dictionary<string, DomainElementSigner>(StringComparer.OrdinalIgnoreCase);
-			settingsMutex = new object();
+			settingsSnapshot = new DkimSettingsSnapshot(new Dictionary<string, DkimSigningContext>(StringComparer.OrdinalIgnoreCase), new[] { HeaderId.From });
+			settingsUpdateMutex = new object();
 		}
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Log general exceptions")]
 		public void UpdateSettings(Settings config)
 		{
-			lock (settingsMutex)
+			if (config == null)
 			{
-				// Load the list of domains
-				domains.Clear();
+				throw new ArgumentNullException("config");
+			}
+
+			lock (settingsUpdateMutex)
+			{
+				Dictionary<string, DomainElementSigner> domains = new Dictionary<string, DomainElementSigner>(StringComparer.OrdinalIgnoreCase);
 
 				DkimSignatureAlgorithm signatureAlgorithm;
 
@@ -74,26 +82,30 @@ namespace Exchange.DkimSigner
 						throw new ArgumentOutOfRangeException("config.SigningAlgorithm");
 				}
 
-				bodyCanonicalization = config.BodyCanonicalization == DkimCanonicalizationKind.Relaxed ? DkimCanonicalizationAlgorithm.Relaxed : DkimCanonicalizationAlgorithm.Simple;
-				headerCanonicalization = config.HeaderCanonicalization == DkimCanonicalizationKind.Relaxed ? DkimCanonicalizationAlgorithm.Relaxed : DkimCanonicalizationAlgorithm.Simple;
+				DkimCanonicalizationAlgorithm bodyCanonicalization = config.BodyCanonicalization == DkimCanonicalizationKind.Relaxed ? DkimCanonicalizationAlgorithm.Relaxed : DkimCanonicalizationAlgorithm.Simple;
+				DkimCanonicalizationAlgorithm headerCanonicalization = config.HeaderCanonicalization == DkimCanonicalizationKind.Relaxed ? DkimCanonicalizationAlgorithm.Relaxed : DkimCanonicalizationAlgorithm.Simple;
 
-				foreach (DomainElement domainElement in config.Domains)
+				foreach (DomainElement domainElement in config.Domains ?? new List<DomainElement>())
 				{
+					if (domainElement == null || string.IsNullOrWhiteSpace(domainElement.Domain) ||
+						string.IsNullOrWhiteSpace(domainElement.Selector) || string.IsNullOrWhiteSpace(domainElement.PrivateKeyFile))
+					{
+						Logger.LogWarning("A domain setting is incomplete and will be ignored.");
+						continue;
+					}
+
+					string domainName = domainElement.Domain.Trim().TrimEnd('.');
+					if (domainName.Length == 0 || domains.ContainsKey(domainName))
+					{
+						Logger.LogWarning("Duplicate or invalid domain setting '" + domainElement.Domain + "'. This domain will be ignored.");
+						continue;
+					}
+
 					string privateKey = domainElement.PrivateKeyPathAbsolute(
 						Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location));
 					if (String.IsNullOrEmpty(privateKey) || !File.Exists(privateKey))
 					{
-						Logger.LogError("The private key for domain " + domainElement.Domain + " wasn't found: " + privateKey + ". Ignoring domain.");
-					}
-
-					//check if the private key can be parsed
-					try
-					{
-						KeyHelper.ParseKeyPair(privateKey);
-					}
-					catch (Exception ex)
-					{
-						Logger.LogError("Couldn't load private key for domain " + domainElement.Domain + ": " + ex.Message);
+						Logger.LogError("The private key for domain " + domainName + " wasn't found: " + privateKey + ". Ignoring domain.");
 						continue;
 					}
 
@@ -102,7 +114,7 @@ namespace Exchange.DkimSigner
 					{
 						AsymmetricKeyParameter key = KeyHelper.ParsePrivateKey(privateKey);
 
-						signer = new MimeKit.Cryptography.DkimSigner(key, domainElement.Domain, domainElement.Selector, signatureAlgorithm)
+						signer = new MimeKit.Cryptography.DkimSigner(key, domainName, domainElement.Selector.Trim(), signatureAlgorithm)
 						{
 							BodyCanonicalizationAlgorithm = bodyCanonicalization,
 							HeaderCanonicalizationAlgorithm = headerCanonicalization
@@ -110,20 +122,29 @@ namespace Exchange.DkimSigner
 					}
 					catch (Exception ex)
 					{
-						Logger.LogError("Could not initialize MimeKit DkimSigner for domain " + domainElement.Domain + ": " + ex.Message);
+						Logger.LogError("Could not initialize MimeKit DkimSigner for domain " + domainName + ": " + ex.Message);
 						continue;
 					}
-					domains.Add(domainElement.Domain, new DomainElementSigner(domainElement, signer));
+					domains.Add(domainName, new DomainElementSigner(domainElement, signer));
 				}
 
 				List<HeaderId> headerList = new List<HeaderId>();
-				foreach (string headerToSign in config.HeadersToSign)
+				foreach (string headerToSign in config.HeadersToSign ?? new List<string>())
 				{
 					if (!Enum.TryParse(headerToSign, true, out HeaderId headerId) || (headerId == HeaderId.Unknown))
 					{
 						Logger.LogWarning("Invalid value for header to sign: '" + headerToSign + "'. This header will be ignored.");
+						continue;
 					}
-					headerList.Add(headerId);
+					if (IsProhibitedDkimHeader(headerId))
+					{
+						Logger.LogWarning("Header '" + headerToSign + "' cannot be included in a DKIM signature and will be ignored.");
+						continue;
+					}
+					if (!headerList.Contains(headerId))
+					{
+						headerList.Add(headerId);
+					}
 				}
 
 				// The From header must always be signed according to the DKIM specification.
@@ -131,16 +152,54 @@ namespace Exchange.DkimSigner
 				{
 					headerList.Add(HeaderId.From);
 				}
-				eligibleHeaders = headerList.ToArray();
+
+				HeaderId[] eligibleHeaders = headerList.ToArray();
+				Dictionary<string, DkimSigningContext> signingContexts = new Dictionary<string, DkimSigningContext>(StringComparer.OrdinalIgnoreCase);
+				foreach (KeyValuePair<string, DomainElementSigner> domain in domains)
+				{
+					signingContexts.Add(domain.Key, new DkimSigningContext(domain.Value, eligibleHeaders));
+				}
+
+				settingsSnapshot = new DkimSettingsSnapshot(signingContexts, eligibleHeaders);
 			}
+		}
+
+		private static bool IsProhibitedDkimHeader(HeaderId headerId)
+		{
+			switch (headerId)
+			{
+				case HeaderId.ReturnPath:
+				case HeaderId.Received:
+				case HeaderId.Comments:
+				case HeaderId.Keywords:
+				case HeaderId.Bcc:
+				case HeaderId.ResentBcc:
+				case HeaderId.DkimSignature:
+					return true;
+				default:
+					return false;
+			}
+		}
+
+		public int DomainCount
+		{
+			get { return settingsSnapshot.Domains.Count; }
 		}
 
 		public Dictionary<string, DomainElementSigner> GetDomains()
 		{
-			lock (settingsMutex)
+			DkimSettingsSnapshot snapshot = settingsSnapshot;
+			Dictionary<string, DomainElementSigner> result = new Dictionary<string, DomainElementSigner>(StringComparer.OrdinalIgnoreCase);
+			foreach (KeyValuePair<string, DkimSigningContext> domain in snapshot.Domains)
 			{
-				return domains;
+				result.Add(domain.Key, domain.Value.DomainSigner);
 			}
+			return result;
+		}
+
+		internal bool TryGetSigningContext(string domain, out DkimSigningContext signingContext)
+		{
+			return settingsSnapshot.Domains.TryGetValue(domain, out signingContext);
 		}
 
 		/// <summary>
@@ -148,9 +207,28 @@ namespace Exchange.DkimSigner
 		/// </summary>
 		/// <param name="domainSigner">The domain and its signer</param>
 		/// <param name="mailItem">The mail item to sign</param>
-		/// <returns></returns>
 		public void SignMessage(DomainElementSigner domainSigner, MailItem mailItem)
 		{
+			if (domainSigner == null)
+			{
+				throw new ArgumentNullException("domainSigner");
+			}
+
+			DkimSettingsSnapshot snapshot = settingsSnapshot;
+			SignMessage(new DkimSigningContext(domainSigner, snapshot.EligibleHeaders), mailItem);
+		}
+
+		internal void SignMessage(DkimSigningContext signingContext, MailItem mailItem)
+		{
+			if (signingContext == null)
+			{
+				throw new ArgumentNullException("signingContext");
+			}
+			if (mailItem == null)
+			{
+				throw new ArgumentNullException("mailItem");
+			}
+
 			// MailItem.GetMimeWriteStream() internally uses
 			// Microsoft.Exchange.Data.Mime.MimeDocument.GetLoadStream(), which may reformat the
 			// message using different formatting than is originally read from
@@ -187,9 +265,9 @@ namespace Exchange.DkimSigner
 					Logger.LogDebug("Signing the message");
 				}
 
-				lock (settingsMutex)
+				lock (signingContext.SyncRoot)
 				{
-					domainSigner.Signer.Sign(message, eligibleHeaders);
+					signingContext.DomainSigner.Signer.Sign(message, signingContext.EligibleHeaders);
 				}
 				var value = message.Headers[HeaderId.DkimSignature];
 				

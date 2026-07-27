@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'Exchange.DkimSigner.PortableBuild'">
+    <!-- Keep the compatibility build from reusing the old-style project's assets file. -->
+    <BaseIntermediateOutputPath>obj\PortableBuild\</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>obj\PortableBuild\</MSBuildProjectExtensionsPath>
+    <BaseOutputPath>bin\PortableBuild\</BaseOutputPath>
+    <!-- SDK default globs otherwise see generated files left in the sibling legacy paths. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;bin\**</DefaultItemExcludes>
+  </PropertyGroup>
+</Project>

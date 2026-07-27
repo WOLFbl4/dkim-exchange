@@ -10,13 +10,30 @@ namespace Configuration.DkimSigner.Exchange
 	{
 		public event EventHandler StatusChanged;
 
+		private sealed class QueuedAction
+		{
+			public TransportServiceAction Action { get; private set; }
+			public Action<string> ErrorCallback { get; private set; }
+
+			public QueuedAction(TransportServiceAction action, Action<string> errorCallback)
+			{
+				Action = action;
+				ErrorCallback = errorCallback;
+			}
+		}
+
+		private static readonly TimeSpan ServiceOperationTimeout = TimeSpan.FromMinutes(2);
+		private static readonly TimeSpan WorkerShutdownTimeout = TimeSpan.FromMinutes(5);
+
 		private Thread thread;
 		private Timer transportServiceStatus;
 
-		private Queue<TransportServiceAction> actions;
-		private Action<string> errorCallback;
+		private readonly Queue<QueuedAction> actions;
+		private readonly object serviceMutex = new object();
 		private ServiceController service;
-		private string status;
+		private volatile string status;
+		private bool workerRunning;
+		private bool disposed;
 
 		/// <summary>
 		/// Constructor
@@ -28,7 +45,7 @@ namespace Configuration.DkimSigner.Exchange
 				throw new ExchangeServerException("No service 'MSExchangeTransport' available.");
 			}
 
-			actions = new Queue<TransportServiceAction>();
+			actions = new Queue<QueuedAction>();
 			service = new ServiceController("MSExchangeTransport");
 			transportServiceStatus = new Timer(CheckExchangeTransportServiceStatus, null, 0, 1000);
 		}
@@ -48,25 +65,11 @@ namespace Configuration.DkimSigner.Exchange
 		/// <returns>ServiceControllerStatus</returns>
 		private ServiceControllerStatus GetTransportServiceStatus()
 		{
-			return service.Status;
-		}
-
-		/// <summary>
-		/// Check if Microsoft Exchange Transport service is running
-		/// </summary>
-		/// <returns>bool</returns>
-		private bool IsTransportServiceRunning()
-		{
-			return (GetTransportServiceStatus() == ServiceControllerStatus.Running);
-		}
-
-		/// <summary>
-		/// Check if Microsoft Exchange Transport service is stopped
-		/// </summary>
-		/// <returns>bool</returns>
-		private bool IsTransportServiceStopped()
-		{
-			return (GetTransportServiceStatus() == ServiceControllerStatus.Stopped);
+			lock (serviceMutex)
+			{
+				service.Refresh();
+				return service.Status;
+			}
 		}
 
 		/// <summary>
@@ -82,15 +85,24 @@ namespace Configuration.DkimSigner.Exchange
 				if (status != s)
 				{
 					status = s;
-					if (StatusChanged != null)
+					EventHandler handler = StatusChanged;
+					if (handler != null)
 					{
-						StatusChanged(this, null);
+						handler(this, EventArgs.Empty);
 					}
 				}
 			}
-			catch (ExchangeServerException)
+			catch (Exception)
 			{
-				transportServiceStatus.Change(Timeout.Infinite, Timeout.Infinite);
+				Timer timer = transportServiceStatus;
+				if (timer != null)
+				{
+					try
+					{
+						timer.Change(Timeout.Infinite, Timeout.Infinite);
+					}
+					catch (ObjectDisposedException) { }
+				}
 			}
 		}
 
@@ -99,64 +111,109 @@ namespace Configuration.DkimSigner.Exchange
 		/// </summary>
 		private void ExecuteAction()
 		{
-			bool queueIsNotEmpty;
-
-			lock (actions)
+			while (true)
 			{
-				queueIsNotEmpty = actions.Count > 0;
-			}
-
-			while (queueIsNotEmpty)
-			{
-				TransportServiceAction action;
+				QueuedAction queuedAction;
 
 				lock (actions)
 				{
-					action = actions.Dequeue();
+					if (actions.Count == 0)
+					{
+						workerRunning = false;
+						return;
+					}
+
+					queuedAction = actions.Dequeue();
 				}
 
-				if (action == TransportServiceAction.Start)
+				try
 				{
-					if (IsTransportServiceStopped())
+					if (queuedAction.Action == TransportServiceAction.Start)
+					{
+						StartTransportService();
+					}
+					else
+					{
+						StopTransportService();
+					}
+				}
+				catch (Exception e)
+				{
+					string operation = queuedAction.Action == TransportServiceAction.Start ? "start" : "stop";
+					string message = "Couldn't " + operation + " 'MSExchangeTransport' service :\n" + e.Message + "\nMake sure you are running the program as an administrator.";
+					if (queuedAction.ErrorCallback != null)
 					{
 						try
 						{
-							service.Start();
-							service.WaitForStatus(ServiceControllerStatus.Running);
+							queuedAction.ErrorCallback(message);
 						}
-						catch (Exception e)
+						catch (Exception callbackError)
 						{
-							if (errorCallback != null)
-								errorCallback("Couldn't start 'MSExchangeTransport' service :\n" + e.Message + "\nMake sure you are running the program as an administrator.");
-							else
-								throw new ExchangeServerException("Couldn't start 'MSExchangeTransport' service :\n" + e.Message + "\nMake sure you are running the program as an administrator.", e);
+							System.Diagnostics.Trace.TraceError(callbackError.ToString());
 						}
 					}
-				}
-				else // action == TransportServiceAction.Stop
-				{
-					if (IsTransportServiceRunning())
-					{
-						try
-						{
-							service.Stop();
-							service.WaitForStatus(ServiceControllerStatus.Stopped);
-						}
-						catch (Exception e)
-						{
-							if (errorCallback != null)
-								errorCallback("Couldn't stop 'MSExchangeTransport' service :\n" + e.Message + "\nMake sure you are running the program as an administrator.");
-							else
-								throw new ExchangeServerException("Couldn't stop 'MSExchangeTransport' service :\n" + e.Message + "\nMake sure you are running the program as an administrator.", e);
-						}
-					}
-				}
-
-				lock (actions)
-				{
-					queueIsNotEmpty = actions.Count > 0;
 				}
 			}
+		}
+
+		private void StartTransportService()
+		{
+			lock (serviceMutex)
+			{
+				StartTransportServiceLocked();
+			}
+		}
+
+		private void StartTransportServiceLocked()
+		{
+			ServiceControllerStatus currentStatus = GetTransportServiceStatus();
+			if (currentStatus == ServiceControllerStatus.Running)
+			{
+				return;
+			}
+			if (currentStatus == ServiceControllerStatus.StartPending)
+			{
+				service.WaitForStatus(ServiceControllerStatus.Running, ServiceOperationTimeout);
+				return;
+			}
+			if (currentStatus == ServiceControllerStatus.StopPending)
+			{
+				service.WaitForStatus(ServiceControllerStatus.Stopped, ServiceOperationTimeout);
+			}
+
+			service.Refresh();
+			service.Start();
+			service.WaitForStatus(ServiceControllerStatus.Running, ServiceOperationTimeout);
+		}
+
+		private void StopTransportService()
+		{
+			lock (serviceMutex)
+			{
+				StopTransportServiceLocked();
+			}
+		}
+
+		private void StopTransportServiceLocked()
+		{
+			ServiceControllerStatus currentStatus = GetTransportServiceStatus();
+			if (currentStatus == ServiceControllerStatus.Stopped)
+			{
+				return;
+			}
+			if (currentStatus == ServiceControllerStatus.StopPending)
+			{
+				service.WaitForStatus(ServiceControllerStatus.Stopped, ServiceOperationTimeout);
+				return;
+			}
+			if (currentStatus == ServiceControllerStatus.StartPending)
+			{
+				service.WaitForStatus(ServiceControllerStatus.Running, ServiceOperationTimeout);
+			}
+
+			service.Refresh();
+			service.Stop();
+			service.WaitForStatus(ServiceControllerStatus.Stopped, ServiceOperationTimeout);
 		}
 
 		/// <summary>
@@ -174,26 +231,37 @@ namespace Configuration.DkimSigner.Exchange
 		/// <param name="action">TransportServiceAction</param>
 		public void Do(TransportServiceAction action, Action<string> errorCallback)
 		{
-			this.errorCallback = errorCallback;
 			lock (actions)
 			{
+				if (disposed)
+				{
+					throw new ObjectDisposedException("TransportService");
+				}
+
 				switch (action)
 				{
 					case TransportServiceAction.Start:
 					case TransportServiceAction.Stop:
-						actions.Enqueue(action);
+						actions.Enqueue(new QueuedAction(action, errorCallback));
 						break;
 					case TransportServiceAction.Restart:
-						actions.Enqueue(TransportServiceAction.Stop);
-						actions.Enqueue(TransportServiceAction.Start);
+						actions.Enqueue(new QueuedAction(TransportServiceAction.Stop, errorCallback));
+						actions.Enqueue(new QueuedAction(TransportServiceAction.Start, errorCallback));
 						break;
+					default:
+						throw new ArgumentOutOfRangeException("action");
 				}
-			}
 
-			if (thread == null || thread.ThreadState == ThreadState.Stopped)
-			{
-				thread = new Thread(ExecuteAction);
-				thread.Start();
+				if (!workerRunning)
+				{
+					workerRunning = true;
+					thread = new Thread(ExecuteAction)
+					{
+						IsBackground = true,
+						Name = "Exchange DKIM Transport Service Worker"
+					};
+					thread.Start();
+				}
 			}
 		}
 
@@ -202,14 +270,11 @@ namespace Configuration.DkimSigner.Exchange
 		/// </summary>
 		public void Dispose()
 		{
-			if (thread != null)
+			Thread worker;
+			lock (actions)
 			{
-				if (thread.ThreadState != ThreadState.Stopped)
-				{
-					thread.Join();
-				}
-
-				thread = null;
+				disposed = true;
+				worker = thread;
 			}
 
 			if (transportServiceStatus != null)
@@ -219,10 +284,18 @@ namespace Configuration.DkimSigner.Exchange
 				transportServiceStatus = null;
 			}
 
-			if (service != null)
+			bool workerStopped = worker == null || !worker.IsAlive || worker.Join(WorkerShutdownTimeout);
+			if (workerStopped)
 			{
-				service.Dispose();
-				service = null;
+				thread = null;
+				lock (serviceMutex)
+				{
+					if (service != null)
+					{
+						service.Dispose();
+						service = null;
+					}
+				}
 			}
 		}
 	}
