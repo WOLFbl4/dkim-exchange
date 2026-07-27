@@ -1,5 +1,7 @@
 ﻿# Exchange DKIM Signer
 
+[Русская версия](README_RU.md)
+
 ## Notice 2023-05-15
 
 You may have noticed there haven't been updates for a while. I've been incredibly busy and since the last update I've migrated away from on-prem Exchange to O365 so I no longer have a personal use for the application.

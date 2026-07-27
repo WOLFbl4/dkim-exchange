@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>ExchangeDkimSigner</AssemblyName>
+    <RootNamespace>Exchange.DkimSigner</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Microsoft.Exchange.Data.Common">
+      <HintPath>lib/Exchange 15/Microsoft.Exchange.Data.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Exchange.Data.Transport">
+      <HintPath>lib/Exchange 15/Microsoft.Exchange.Data.Transport.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <PackageReference Include="MimeKit" Version="2.15.1" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+</Project>

@@ -17,10 +17,18 @@ namespace Exchange.DkimSigner
 		/// </summary>
 		private readonly DkimSigner dkimSigner;
 
-		/// <summary>  
-		/// This context to allow Exchange to continue processing a message  
-		/// </summary>  
-		private AgentAsyncContext agentAsyncContext;
+		private sealed class MessageEventState
+		{
+			public MessageEventState(AgentAsyncContext asyncContext, MailItem mailItem)
+			{
+				AsyncContext = asyncContext;
+				MailItem = mailItem;
+			}
+
+			public AgentAsyncContext AsyncContext { get; private set; }
+
+			public MailItem MailItem { get; private set; }
+		}
 
 		/// <summary>
 		/// Initializes a new instance of the <see cref="DkimSigningRoutingAgent"/> class.
@@ -51,21 +59,18 @@ namespace Exchange.DkimSigner
 				Logger.LogDebug("Got new message, checking if I can sign it...");
 			}
 
-			// get the async context. For an example see: http://www.getcodesamples.com/src/D062E1E9/2552BA7
-			// The agent uses the agentAsyncContext object when the agent uses asynchronous execution.
-			// The AgentAsyncContext.Complete() method must be invoked
-			// before the server will continue processing a message
-			agentAsyncContext = GetAgentAsyncContext();
-
-			ThreadPool.QueueUserWorkItem(new WaitCallback(HandleMessageEvent), e.MailItem);
+			var state = new MessageEventState(GetAgentAsyncContext(), e.MailItem);
+			ThreadPool.QueueUserWorkItem(new WaitCallback(HandleMessageEvent), state);
 		}
 
 		[SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Log general exceptions")]
-		private void HandleMessageEvent(Object mailItem)
+		private void HandleMessageEvent(Object messageEventState)
 		{
+			var state = (MessageEventState)messageEventState;
+
 			try
 			{
-				SignMailItem((MailItem)mailItem);
+				SignMailItem(state.MailItem);
 			}
 			catch (Exception ex)
 			{
@@ -73,8 +78,8 @@ namespace Exchange.DkimSigner
 			}
 			finally
 			{
-				agentAsyncContext.Complete();
-				agentAsyncContext = null;
+				state.AsyncContext.Resume();
+				state.AsyncContext.Complete();
 			}
 		}
 
